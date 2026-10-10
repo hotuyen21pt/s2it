@@ -218,6 +218,10 @@ def train(
     )
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=model_dtype)
     model.config.use_cache = False
+    # Reentrant gradient checkpointing needs grad-enabled inputs even when the
+    # base model is frozen and only LoRA adapters are trainable.
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
     model = get_peft_model(
         model,
         LoraConfig(
