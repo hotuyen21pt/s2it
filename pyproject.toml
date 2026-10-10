@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asqp-s2it"
+version = "0.1.0"
+description = "Stepwise Syntax Integration Tuning for aspect sentiment quad prediction"
+requires-python = ">=3.10"
+dependencies = [
+    "peft>=0.12.0",
+    "stanza>=1.8.2",
+    "torch>=2.2.0",
+    "transformers>=4.45.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+language-detection = ["langdetect>=1.0.9"]
+
+[project.scripts]
+asqp-s2it = "asqp_s2it.cli:main"
+asqp-prepare-language = "asqp_s2it.language_prep:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
