@@ -87,6 +87,7 @@ def test_resources_directory_is_passed_for_each_record_language(tmp_path, monkey
     assert [pipeline["lang"] for pipeline in captured] == ["en", "fr", "zh-hans"]
     assert all(pipeline["dir"] == str(tmp_path) for pipeline in captured)
     assert all(pipeline["download_method"] is None for pipeline in captured)
+    assert all(pipeline["package"] is None for pipeline in captured)
     assert all(
         pipeline["processors"] == {
             "tokenize": "default",

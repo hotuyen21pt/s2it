@@ -127,6 +127,10 @@ class DependencyParser:
                     "lemma": "default",
                     "depparse": "default",
                 }
+            else:
+                # A package="default" can add every processor in that package,
+                # including constituency models we do not download or use.
+                pipeline_options["package"] = None
             return stanza.Pipeline(
                 lang=language,
                 processors=processors,
