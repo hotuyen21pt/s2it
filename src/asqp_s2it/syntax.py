@@ -178,6 +178,33 @@ class DependencyParser:
         return ParsedText(tuple(words), tuple(heads))
 
 
+class CachedDependencyParser:
+    """Dependency parser backed by locally precomputed JSONL parses."""
+
+    def __init__(self, cache_path: str | Path) -> None:
+        import json
+
+        self._cache: dict[tuple[str, str], ParsedText] = {}
+        source = Path(cache_path)
+        with source.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                key = (row["text"], row["language"])
+                parsed = ParsedText(tuple(row["words"]), tuple(row["heads"]))
+                if len(parsed.words) != len(parsed.heads):
+                    raise ValueError(f"{source}:{line_number}: words/heads length mismatch")
+                self._cache[key] = parsed
+
+    def parse(self, text: str, language: str | None = None) -> ParsedText:
+        key = (text, language or "")
+        try:
+            return self._cache[key]
+        except KeyError as error:
+            raise KeyError(f"No cached Stanza parse for language={key[1]!r}, text={text[:80]!r}") from error
+
+
 def download_parser_models(languages: list[str]) -> None:
     for language in languages:
         stanza.download(

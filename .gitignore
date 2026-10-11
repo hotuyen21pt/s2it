@@ -4,3 +4,4 @@ asqp_data/
 __pycache__/
 *.py[cod]
 *.egg-info/
+.offline_bundle/
