@@ -83,6 +83,11 @@ STAGE_FRACTIONS = (0.25, 0.25, 0.50)
 # --- Inference ---------------------------------------------------------------
 # Measured on this data: the label string is ~22 tokens, longest 136.
 MAX_NEW_TOKENS = 256
+# Install the bundled transformers/peft set instead of Kaggle's newer one.
+# Kaggle's stack broke two runs at the Trainer API; the bundle is the
+# combination this code was written against. False uses Kaggle's.
+PIN_BUNDLED_VERSIONS = True
+
 RUN_TRAINING   = True
 RUN_INFERENCE  = True
 
@@ -209,6 +214,24 @@ REQUIRED = ("transformers", "tokenizers", "accelerate", "peft",
 # torchao. Nothing here uses torchao quantisation, so dropping it is the fix.
 subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", "torchao"],
                check=False)
+
+# The bundled stack (transformers 4.48.3, peft 0.14.0, huggingface-hub 0.28.1
+# and their matching tokenizers/accelerate/safetensors) is what this code was
+# written against. Kaggle's own stack is newer and has already broken two runs
+# at the Trainer API, so the pinned set is the default. Set this to False to
+# run on whatever Kaggle ships; the code adapts, but reports what it lost.
+if PIN_BUNDLED_VERSIONS:
+    bundled = sorted(Path(WHEELHOUSE).glob("*.whl"))
+    if bundled:
+        print("Pinning the bundled stack:",
+              ", ".join(w.name.split("-")[0] + " " + w.name.split("-")[1] for w in bundled))
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+            "--no-index", "--no-deps", "--force-reinstall", *[str(w) for w in bundled],
+        ])
+        importlib.invalidate_caches()
+    else:
+        print("PIN_BUNDLED_VERSIONS is set but the wheelhouse is empty.")
 
 missing = []
 for name in REQUIRED:

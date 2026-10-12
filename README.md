@@ -223,6 +223,11 @@ The notebook finds the zip under `/kaggle/input`, unpacks it, locates Qwen,
 and installs the six wheels from the bundle.
 
 ### The Kaggle environment is not pinned
+> **Two runs were lost to the Kaggle image's transformers.** `PIN_BUNDLED_VERSIONS`
+> defaults to `True`, which force-installs the bundled transformers 4.48.3 /
+> peft 0.14.0 set this code was written against. Set it to `False` to run on
+> whatever Kaggle ships; `_training_arguments()` then filters `TrainingArguments`
+> against the installed signature and prints what it had to drop.
 
 The bundled wheelhouse is a **fallback, not a pin**. The notebook installs
 from it only what is genuinely missing, and prints the versions actually in
