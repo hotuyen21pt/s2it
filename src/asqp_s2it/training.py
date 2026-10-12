@@ -483,7 +483,12 @@ def train(
 
     check_gpu_memory(model_name, lora_rank)
     model_load_started = time.perf_counter()
-    print("Loading base model and tokenizer...", flush=True)
+    print(f"Loading {model_name}", flush=True)
+    print(
+        "  Reading ~15 GB of weights from the Kaggle input mount; this is the "
+        "longest step with no output, often several minutes.",
+        flush=True,
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
