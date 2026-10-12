@@ -7,7 +7,7 @@ uploaded archive. This script does all of it in one command:
   1. run langdetect once and write the language into every JSONL record,
   2. download the Stanza models for the languages actually present,
   3. parse every sentence with Stanza and cache words/heads to JSONL,
-  4. download the Linux/py3.11 wheels Kaggle is missing,
+  4. download the Linux wheels Kaggle is missing,
   5. zip project source + data + parse cache + wheelhouse.
 
 The Qwen model is NOT packaged: attach it separately as a Kaggle Model input.
@@ -51,7 +51,7 @@ WHEELS = (
     "huggingface-hub==0.28.1",
     "safetensors==0.6.2",
 )
-KAGGLE_PYTHON = "3.11"
+KAGGLE_PYTHON = "3.12"  # Kaggle image Python; check a run log if it changes
 KAGGLE_PLATFORM = "manylinux2014_x86_64"
 
 PROJECT_FILES = ("pyproject.toml", "README.md")
