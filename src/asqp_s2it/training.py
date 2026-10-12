@@ -128,6 +128,47 @@ def _dtype_kwargs(dtype) -> dict[str, Any]:
     return {"dtype": dtype} if major >= 5 else {"torch_dtype": dtype}
 
 
+def _auto_device_map() -> str | None:
+    """Shard across GPUs only when there is more than one.
+
+    With a single device `device_map="auto"` offloads whatever does not fit to
+    CPU instead of failing. That is roughly fifty times slower and presents as
+    a run that simply never finishes, so one GPU loads normally and lets
+    `check_gpu_memory` decide whether the configuration is possible at all.
+    """
+    if not torch.cuda.is_available():
+        return None
+    return "auto" if torch.cuda.device_count() > 1 else None
+
+
+def assert_not_offloaded(model: Any) -> None:
+    """Stop if accelerate placed any layer on CPU or disk.
+
+    An offloaded layer copies its weights over PCIe on every forward and every
+    backward pass. A stage that should take half an hour then reports an ETA of
+    twenty-two hours, which is how this was found.
+    """
+    device_map = getattr(model, "hf_device_map", None)
+    if not device_map:
+        return
+    placements: dict[str, int] = {}
+    for device in device_map.values():
+        placements[str(device)] = placements.get(str(device), 0) + 1
+    print(f"Model placement: {placements}", flush=True)
+    spilled = sorted(
+        name for name, device in device_map.items() if str(device) in {"cpu", "disk"}
+    )
+    if spilled:
+        raise RuntimeError(
+            f"{len(spilled)} module(s) were offloaded to CPU or disk because they "
+            f"did not fit in GPU memory, for example {spilled[:3]}.\n"
+            "Training would still run, roughly fifty times slower, so it stops "
+            "here instead.\n"
+            "  - Switch the Kaggle accelerator to 'GPU T4 x2', or\n"
+            "  - Lower LORA_RANK and MAX_LENGTH and record the deviation."
+        )
+
+
 def _model_parameter_count(model_name: str) -> int | None:
     """Parameter count from the config alone, without loading any weights."""
     try:
@@ -412,13 +453,14 @@ def train(
     lora_rank: int = 32,
     max_length: int = 2048,
     time_budget_seconds: float | None = None,
-    stage_fractions: tuple[float, float, float] = (0.25, 0.25, 0.50),
+    stage_fractions: tuple[float, float, float] | None = None,
 ) -> dict[str, Any]:
     """Run the three S2IT stages, optionally inside a wall-clock budget.
 
-    `time_budget_seconds` is the time this call may take end to end. It is split
-    across the stages by `stage_fractions`; fine-grained structural tuning gets
-    the largest share because it has the most examples per sentence.
+    `time_budget_seconds` is the time this call may take end to end. It is
+    split across the stages in proportion to how many examples each one
+    actually builds - 2, 1 and 7 per sentence, so 20/10/70 - rather than by a
+    fixed guess. Pass `stage_fractions` to override.
     """
     started_at = time.perf_counter()
     budget = Budget(time_budget_seconds)
@@ -452,13 +494,12 @@ def train(
         if torch.cuda.is_available()
         else torch.float32
     )
-    # device_map shards a model too large for one card across every visible
-    # GPU, and tells Trainer not to move it itself.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map="auto" if torch.cuda.is_available() else None,
+        device_map=_auto_device_map(),
         **_dtype_kwargs(model_dtype),
     )
+    assert_not_offloaded(model)
     model.config.use_cache = False
     # Reentrant gradient checkpointing needs grad-enabled inputs even when the
     # base model is frozen and only LoRA adapters are trainable.
@@ -486,7 +527,23 @@ def train(
     stage_times: dict[str, float] = {}
     # Reserve time to save the adapter once the last stage ends.
     save_reserve = 0.0 if budget.unlimited else min(300.0, max(60.0, budget.remaining() * 0.02))
-    remaining_fractions = list(stage_fractions)
+    if stage_fractions is None:
+        # Each stage costs in proportion to its example count: a fixed 25/25/50
+        # starved fine-grained tuning, which builds seven examples per sentence,
+        # while over-funding classification, which builds one.
+        sizes = [len(stage) for stage in train_stages]
+        total_examples = sum(sizes) or 1
+        remaining_fractions = [size / total_examples for size in sizes]
+        print(
+            "Budget split by example count: "
+            + ", ".join(
+                f"{name} {share:.0%} ({size} examples)"
+                for name, share, size in zip(stage_names, remaining_fractions, sizes)
+            ),
+            flush=True,
+        )
+    else:
+        remaining_fractions = list(stage_fractions)
     for stage_index, (stage_name, examples, _dev_examples) in enumerate(
         zip(stage_names, train_stages, dev_stages)
     ):

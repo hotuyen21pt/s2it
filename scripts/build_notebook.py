@@ -80,9 +80,10 @@ LORA_RANK                   = 32    # = paper (alpha 32, dropout 0.1 in training
 # Measured on this data: the longest stage-3 example is 786 tokens, so the
 # previous 768 silently truncated one example in 3,600. 1024 truncates none.
 MAX_LENGTH                  = 1024
-# Share of the training budget per stage. Fine-grained structural tuning gets
-# the most because it builds seven auxiliary examples per sentence.
-STAGE_FRACTIONS = (0.25, 0.25, 0.50)
+# How the training budget is split across the three stages. None derives it
+# from the example count each stage actually builds (2, 1 and 7 per sentence,
+# so 20/10/70). A fixed 25/25/50 starved fine-grained tuning.
+STAGE_FRACTIONS = None
 
 # --- Inference ---------------------------------------------------------------
 # Measured on this data: the label string is ~22 tokens, longest 136.
