@@ -56,36 +56,33 @@ INFERENCE_RESERVE_MINUTES = 180  # full test split with beam-4 decoding
 SAFETY_MARGIN_MINUTES    = 15    # never finish exactly on the limit
 
 # --- Data --------------------------------------------------------------------
-# Two configurations fit a 9-hour session. Pick one; both evaluate on the
-# whole test split, so their F1 is directly comparable.
-#
-#   A. full data, fewer epochs   DATA_PERCENT = 100, EPOCHS = 2  -> 8h47
-#   B. paper's epochs, less data DATA_PERCENT = 34,  EPOCHS = 5  -> 8h00
-#
-# B trains on ~2,900 sentences, which is exactly the Laptop-ACOS training
-# split this paper was published on, and runs the 5 epochs of Table 5.
-# A keeps every sentence but stops at 2 of the paper's 5 epochs.
-DATA_PERCENT     = 100   # 100 = full splits
+# The bundle already carries the agreed 1,530-sentence training subset and
+# the full 1,831-sentence test split, shared byte-for-byte with the
+# Tree-CoT-RT bundle. Leave this at 100 to use exactly what it is given.
+DATA_PERCENT     = 100
 DATA_SAMPLE_SEED = 444
 MAX_EVAL_RECORDS = None  # None = the whole test split
 
 # --- Fine-tuning -------------------------------------------------------------
-# These are the values that fit a 16 GB Kaggle GPU with a 7B backbone.
-# The S2IT paper uses rank 32 / max_length 2048 / 5 epochs on an A100; raise
-# them only if you move to a bigger accelerator.
-# Full data at 2 epochs is what fits one session; see the budget table below.
-EPOCHS                      = 2
-BATCH_SIZE                  = 1
-GRADIENT_ACCUMULATION_STEPS = 8
-LEARNING_RATE               = 5e-5
-LORA_RANK                   = 8
-MAX_LENGTH                  = 768
+# Table 5 of the paper, reproduced: lr 5e-5, 5 epochs, LoRA rank 32 /
+# alpha 32 / dropout 0.1, cosine schedule.
+# The paper's "batch size 4, gradient accumulation 2" is an effective batch of
+# 8, and 1 x 8 below is the same optimiser trajectory while fitting 16 GB.
+EPOCHS                      = 5     # = paper
+BATCH_SIZE                  = 1     # paper 4, but 1 x 8 == 4 x 2 effective
+GRADIENT_ACCUMULATION_STEPS = 8     # effective batch 8 = paper
+LEARNING_RATE               = 5e-5  # = paper
+LORA_RANK                   = 32    # = paper (alpha 32, dropout 0.1 set in training.py)
+# Measured on this data: the longest stage-3 example is 786 tokens, so the
+# previous 768 silently truncated one example in 3,600. 1024 truncates none.
+MAX_LENGTH                  = 1024
 # Share of the training budget per stage. Fine-grained structural tuning gets
 # the most because it builds seven auxiliary examples per sentence.
 STAGE_FRACTIONS = (0.25, 0.25, 0.50)
 
 # --- Inference ---------------------------------------------------------------
-MAX_NEW_TOKENS = 256   # the paper's label format is short; 256 is ample
+# Measured on this data: the label string is ~22 tokens, longest 136.
+MAX_NEW_TOKENS = 256
 RUN_TRAINING   = True
 RUN_INFERENCE  = True
 
@@ -275,10 +272,11 @@ Each stage gets a slice of the remaining budget and **stops at its deadline**,
 so the adapter is written even if the data is larger than the session allows.
 `training_metrics.json` records which stages were truncated.
 
-**Measured on this dataset** (8,815 train sentences, 16 GB GPU, the settings
-above): roughly 35 min + 20 min + 1 h 55 min per epoch for stages 1-3, so
-`EPOCHS = 2` lands near 5 h 30 m and fits the training budget. Stage 3 is the
-long one because it builds seven auxiliary examples per sentence.
+**Measured on this dataset**: roughly 35 min + 20 min + 1 h 55 min per epoch
+for stages 1-3 at 8,557 sentences, so about 2 h 42 m per epoch. On the
+1,530-sentence subset that is ~29 min per epoch, and the paper's 5 epochs
+cost about 2 h 25 m. Stage 3 is the long one because it builds seven
+auxiliary examples per sentence.
 """)
 
 code(r'''
@@ -353,42 +351,45 @@ S2IT time goes into fine-tuning, which is compute-bound, and the T4 has
 65 TFLOPS of fp16 against the P100's 19. (Tree-CoT-RT is the opposite case:
 it is dominated by decoding, so the P100's memory bandwidth wins there.)
 
-### Budget for a full-data run
-
-Measured on this dataset (8,557 train / 1,831 test after language filtering):
+### Budget
 
 | | time |
 |---|---|
 | setup: wheels, model load, tokenisation | ~0h20 |
-| training, 1 epoch over all three stages | ~2h42 |
-| full test split, 3 generations/sentence, beam 4 | ~2h48 |
+| training, 5 epochs over 1,530 sentences | ~2h25 |
+| full 1,831-sentence test split, 3 generations/sentence, beam 4 | ~2h50 |
 | safety margin | 0h15 |
+| **total** | **~5h50 of 9h** |
 
-So `EPOCHS = 2` gives **0h20 + 5h24 + 2h48 + 0h15 = 8h47**, which fits a
-9-hour session with little to spare. `EPOCHS = 3` needs 11h29 and does not.
+Comfortable, which is the point: every hyperparameter is the paper's, and
+the headroom absorbs the uncertainty in the inference estimate.
 
 If the session still runs short, inference is what gets cut, and the metrics
 table reports how many sentences were left unscored — F1 stays measured over
 the full split either way.
 
-### Configuration B: the paper's 5 epochs
+### Why 1,530 training sentences
 
-| DATA_PERCENT | sentences | EPOCHS | train | + full eval | total |
-|---|---|---|---|---|---|
-| 100 | 8,557 | 2 | 5h24 | 2h48 | 8h47 |
-| 100 | 8,557 | 5 | 13h30 | 2h48 | **16h53 — does not fit** |
-| 34 | ~2,900 | **5** | 4h35 | 2h48 | **8h00** |
-| 18 | ~1,530 | **5** | 2h25 | 2h48 | 5h48 |
+| sentences | epochs | train | + full eval | total |
+|---|---|---|---|---|
+| 8,557 | 2 | 5h24 | 2h50 | 8h47 |
+| 8,557 | **5 = paper** | 13h30 | 2h50 | **16h53 — does not fit** |
+| **1,530** | **5 = paper** | **2h25** | **2h50** | **5h50** |
 
-The last two rows are the Laptop-ACOS and Restaurant-ACOS training splits,
-the data this method was published on. Training on that many sentences with
-the paper's 5 epochs is a more faithful baseline than training on all 8,557
-for 2 epochs — and it leaves headroom in the session.
+1,530 is not an arbitrary cut: it is the size of the **Restaurant-ACOS
+training split**, one of the two datasets this method was published on
+(the other, Laptop-ACOS, has 2,934). Training at that scale with the
+paper's 5 epochs is a faithful reproduction. Keeping all 8,557 sentences
+but stopping at 2 of 5 epochs is not.
 
-**Two sessions instead**, to keep both full data and 5 epochs: run this one
-with `RUN_INFERENCE = False` and `EPOCHS = 5`, *Save Version*, then in the
-next session attach this output, set `RUN_TRAINING = False` and point
-`ADAPTER_DIR` at the attached `s2it_outputs/final`.
+The same 1,530 sentences are in the Tree-CoT-RT bundle, and both evaluate
+on the same 1,831 test sentences, so the two baselines are comparable to
+each other and to anything else trained on that subset.
+
+**Two sessions**, if you want all 8,557 sentences at 5 epochs anyway: run
+this one with `RUN_INFERENCE = False`, *Save Version*, then next session
+attach the output, set `RUN_TRAINING = False` and point `ADAPTER_DIR` at
+the attached `s2it_outputs/final`.
 """)
 
 code(r'''
