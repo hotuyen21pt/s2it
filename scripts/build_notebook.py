@@ -52,18 +52,19 @@ SESSION_START = time.perf_counter()
 # Training stops at its own deadline instead, so the adapter is always saved.
 SESSION_BUDGET_HOURS     = 9.0   # Kaggle GPU session limit
 SETUP_RESERVE_MINUTES    = 20    # wheels, model load, tokenisation
-INFERENCE_RESERVE_MINUTES = 100  # beam-4 decoding is slow; see note below
+INFERENCE_RESERVE_MINUTES = 180  # full test split with beam-4 decoding
 SAFETY_MARGIN_MINUTES    = 15    # never finish exactly on the limit
 
 # --- Data --------------------------------------------------------------------
-DATA_PERCENT     = 100   # sample a slice of every split for a quick trial
+DATA_PERCENT     = 100   # 100 = full splits; lower only for a quick trial
 DATA_SAMPLE_SEED = 444
-MAX_EVAL_RECORDS = 600   # see 'Evaluating the full test split' below; None = all
+MAX_EVAL_RECORDS = None  # None = the whole test split
 
 # --- Fine-tuning -------------------------------------------------------------
 # These are the values that fit a 16 GB Kaggle GPU with a 7B backbone.
 # The S2IT paper uses rank 32 / max_length 2048 / 5 epochs on an A100; raise
 # them only if you move to a bigger accelerator.
+# Full data at 2 epochs is what fits one session; see the budget table below.
 EPOCHS                      = 2
 BATCH_SIZE                  = 1
 GRADIENT_ACCUMULATION_STEPS = 8
@@ -81,7 +82,11 @@ RUN_INFERENCE  = True
 
 # --- Paths -------------------------------------------------------------------
 OUTPUT_DIR = "/kaggle/working/s2it_outputs"
-MODEL_DIR  = f"{OUTPUT_DIR}/final"
+# Point this at an attached previous run's `s2it_outputs/final` to evaluate an
+# adapter trained in an earlier session (set RUN_TRAINING = False as well).
+# Leave None to use the adapter this session trains.
+ADAPTER_DIR = None
+MODEL_DIR  = ADAPTER_DIR or f"{OUTPUT_DIR}/final"
 BASE_MODEL = None       # auto-discovered; set to override
 PROJECT_DIR = None      # auto-discovered from the attached zip
 DATA_DIR = None
@@ -161,8 +166,17 @@ for required in (
     if not required.exists():
         raise FileNotFoundError(f"Missing offline input: {required}")
 
+if ADAPTER_DIR is not None and not (Path(MODEL_DIR) / "adapter_config.json").is_file():
+    raise FileNotFoundError(
+        f"ADAPTER_DIR is set but {MODEL_DIR}/adapter_config.json is missing. "
+        "Attach the previous run's output and point ADAPTER_DIR at its "
+        "s2it_outputs/final directory."
+    )
+
 sys.path.insert(0, str(Path(PROJECT_DIR) / "src"))
 print("Project :", PROJECT_DIR)
+if ADAPTER_DIR is not None:
+    print("Adapter :", MODEL_DIR, "(reusing a previous session)")
 print("Data    :", DATA_DIR)
 print("Model   :", BASE_MODEL)
 print("Output  :", OUTPUT_DIR)
@@ -324,20 +338,28 @@ aborting the run, and the loop stops at the inference deadline — any sentence
 left unscored counts as a recall miss rather than silently shrinking the test
 set, so the reported F1 is always over the full evaluation split.
 
-### Evaluating the full test split
+### Budget for a full-data run
 
-Beam-4 decoding runs three generations per sentence, so all 1,890 test
-sentences need roughly 3 hours — more than one session has left after
-training. To report F1 over the whole split, use two sessions:
+Measured on this dataset (8,557 train / 1,831 test after language filtering):
 
-1. **This session**: `RUN_INFERENCE = False`. Train, then *Save Version* so
-   `s2it_outputs/final/` becomes a downloadable output.
-2. **Next session**: attach this notebook's output as an input, set
-   `RUN_TRAINING = False`, `MAX_EVAL_RECORDS = None`, and point `MODEL_DIR`
-   at the attached `s2it_outputs/final`. The full 9 hours then goes to inference.
+| | time |
+|---|---|
+| setup: wheels, model load, tokenisation | ~0h20 |
+| training, 1 epoch over all three stages | ~2h42 |
+| full test split, 3 generations/sentence, beam 4 | ~2h48 |
+| safety margin | 0h15 |
 
-With the default `MAX_EVAL_RECORDS = 600` both fit in one session, and the
-metrics table reports exactly how many sentences were scored.
+So `EPOCHS = 2` gives **0h20 + 5h24 + 2h48 + 0h15 = 8h47**, which fits a
+9-hour session with little to spare. `EPOCHS = 3` needs 11h29 and does not.
+
+If the session still runs short, inference is what gets cut, and the metrics
+table reports how many sentences were left unscored — F1 stays measured over
+the full split either way.
+
+**Two sessions instead**, to afford more epochs: run this one with
+`RUN_INFERENCE = False` and `EPOCHS = 3`, *Save Version*, then in the next
+session attach this output, set `RUN_TRAINING = False` and point
+`ADAPTER_DIR` at the attached `s2it_outputs/final`.
 """)
 
 code(r'''
