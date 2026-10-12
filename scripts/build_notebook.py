@@ -56,7 +56,16 @@ INFERENCE_RESERVE_MINUTES = 180  # full test split with beam-4 decoding
 SAFETY_MARGIN_MINUTES    = 15    # never finish exactly on the limit
 
 # --- Data --------------------------------------------------------------------
-DATA_PERCENT     = 100   # 100 = full splits; lower only for a quick trial
+# Two configurations fit a 9-hour session. Pick one; both evaluate on the
+# whole test split, so their F1 is directly comparable.
+#
+#   A. full data, fewer epochs   DATA_PERCENT = 100, EPOCHS = 2  -> 8h47
+#   B. paper's epochs, less data DATA_PERCENT = 34,  EPOCHS = 5  -> 8h00
+#
+# B trains on ~2,900 sentences, which is exactly the Laptop-ACOS training
+# split this paper was published on, and runs the 5 epochs of Table 5.
+# A keeps every sentence but stops at 2 of the paper's 5 epochs.
+DATA_PERCENT     = 100   # 100 = full splits
 DATA_SAMPLE_SEED = 444
 MAX_EVAL_RECORDS = None  # None = the whole test split
 
@@ -338,6 +347,12 @@ aborting the run, and the loop stops at the inference deadline — any sentence
 left unscored counts as a recall miss rather than silently shrinking the test
 set, so the reported F1 is always over the full evaluation split.
 
+### Pick the T4 accelerator, not P100
+
+S2IT time goes into fine-tuning, which is compute-bound, and the T4 has
+65 TFLOPS of fp16 against the P100's 19. (Tree-CoT-RT is the opposite case:
+it is dominated by decoding, so the P100's memory bandwidth wins there.)
+
 ### Budget for a full-data run
 
 Measured on this dataset (8,557 train / 1,831 test after language filtering):
@@ -356,9 +371,23 @@ If the session still runs short, inference is what gets cut, and the metrics
 table reports how many sentences were left unscored — F1 stays measured over
 the full split either way.
 
-**Two sessions instead**, to afford more epochs: run this one with
-`RUN_INFERENCE = False` and `EPOCHS = 3`, *Save Version*, then in the next
-session attach this output, set `RUN_TRAINING = False` and point
+### Configuration B: the paper's 5 epochs
+
+| DATA_PERCENT | sentences | EPOCHS | train | + full eval | total |
+|---|---|---|---|---|---|
+| 100 | 8,557 | 2 | 5h24 | 2h48 | 8h47 |
+| 100 | 8,557 | 5 | 13h30 | 2h48 | **16h53 — does not fit** |
+| 34 | ~2,900 | **5** | 4h35 | 2h48 | **8h00** |
+| 18 | ~1,530 | **5** | 2h25 | 2h48 | 5h48 |
+
+The last two rows are the Laptop-ACOS and Restaurant-ACOS training splits,
+the data this method was published on. Training on that many sentences with
+the paper's 5 epochs is a more faithful baseline than training on all 8,557
+for 2 epochs — and it leaves headroom in the session.
+
+**Two sessions instead**, to keep both full data and 5 epochs: run this one
+with `RUN_INFERENCE = False` and `EPOCHS = 5`, *Save Version*, then in the
+next session attach this output, set `RUN_TRAINING = False` and point
 `ADAPTER_DIR` at the attached `s2it_outputs/final`.
 """)
 
