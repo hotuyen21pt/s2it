@@ -72,7 +72,11 @@ EPOCHS                      = 5     # = paper
 BATCH_SIZE                  = 1     # paper 4, but 1 x 8 == 4 x 2 effective
 GRADIENT_ACCUMULATION_STEPS = 8     # effective batch 8 = paper
 LEARNING_RATE               = 5e-5  # = paper
-LORA_RANK                   = 32    # = paper (alpha 32, dropout 0.1 set in training.py)
+# Needs 'GPU T4 x2'. A 7B in fp16 is 14.2 GiB of one card's 14.6, leaving
+# 0.37 GiB, and rank 32 wants 0.92 GiB of weights plus AdamW state. On a
+# single card use 8, and record it as a deviation. train() checks this
+# before loading any weights and says which applies.
+LORA_RANK                   = 32    # = paper (alpha 32, dropout 0.1 in training.py)
 # Measured on this data: the longest stage-3 example is 786 tokens, so the
 # previous 768 silently truncated one example in 3,600. 1024 truncates none.
 MAX_LENGTH                  = 1024
@@ -403,11 +407,20 @@ aborting the run, and the loop stops at the inference deadline — any sentence
 left unscored counts as a recall miss rather than silently shrinking the test
 set, so the reported F1 is always over the full evaluation split.
 
-### Pick the T4 accelerator, not P100
+### Accelerator: **GPU T4 x2**
 
-S2IT time goes into fine-tuning, which is compute-bound, and the T4 has
-65 TFLOPS of fp16 against the P100's 19. (Tree-CoT-RT is the opposite case:
-it is dominated by decoding, so the P100's memory bandwidth wins there.)
+Two reasons, and the second is a hard requirement:
+
+- S2IT time goes into fine-tuning, which is compute-bound, and a T4 has
+  65 TFLOPS of fp16 against the P100's 19.
+- **Qwen2.5-7B in fp16 is 14.2 GiB and a single T4 has 14.6 GiB.** That
+  leaves 0.37 GiB, while the paper's LoRA rank 32 needs 0.92 GiB once AdamW
+  keeps its two states. One card can only run rank 8. Two cards shard the
+  model through `device_map="auto"` and keep the paper's rank.
+
+`train()` checks this before loading any weights and names the fix rather
+than failing minutes later inside `Trainer.__init__` with a CUDA
+out-of-memory traceback that never mentions LoRA.
 
 ### Budget
 

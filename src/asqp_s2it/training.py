@@ -128,6 +128,110 @@ def _dtype_kwargs(dtype) -> dict[str, Any]:
     return {"dtype": dtype} if major >= 5 else {"torch_dtype": dtype}
 
 
+def _model_parameter_count(model_name: str) -> int | None:
+    """Parameter count from the config alone, without loading any weights."""
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        layers = config.num_hidden_layers
+        hidden = config.hidden_size
+        inter = config.intermediate_size
+        heads = config.num_attention_heads
+        kv_heads = getattr(config, "num_key_value_heads", heads)
+        head_dim = getattr(config, "head_dim", hidden // heads)
+    except Exception:
+        return None
+    kv = kv_heads * head_dim
+    per_layer = 2 * hidden * hidden + 2 * hidden * kv + 3 * hidden * inter
+    embeddings = config.vocab_size * hidden
+    if not getattr(config, "tie_word_embeddings", False):
+        embeddings *= 2
+    return layers * per_layer + embeddings
+
+
+def _lora_parameter_count(model_name: str, rank: int) -> int | None:
+    """Trainable parameters LoRA adds to the seven targeted projections."""
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        hidden = config.hidden_size
+        inter = config.intermediate_size
+        heads = config.num_attention_heads
+        kv_heads = getattr(config, "num_key_value_heads", heads)
+        head_dim = getattr(config, "head_dim", hidden // heads)
+    except Exception:
+        return None
+    kv = kv_heads * head_dim
+    widths = [
+        (hidden, hidden), (hidden, kv), (hidden, kv), (hidden, hidden),
+        (hidden, inter), (hidden, inter), (inter, hidden),
+    ]
+    return config.num_hidden_layers * sum(rank * (a + b) for a, b in widths)
+
+
+def check_gpu_memory(model_name: str, lora_rank: int, dtype_bytes: int = 2) -> None:
+    """Fail before loading weights if this model and rank cannot possibly fit.
+
+    The base model dominates: a 7B in fp16 is 14.2 GiB of a 16 GB card's
+    14.6 GiB, so the LoRA weights and their two AdamW states decide whether a
+    run is possible at all. Discovering that during `Trainer.__init__` wastes
+    several minutes and produces a traceback that does not name the cause.
+    """
+    if not torch.cuda.is_available():
+        return
+    params = _model_parameter_count(model_name)
+    lora = _lora_parameter_count(model_name, lora_rank)
+    if params is None or lora is None:
+        return
+    gib = float(2**30)
+    weights = params * dtype_bytes / gib
+    # LoRA weights stay fp32, and AdamW keeps two states of the same size.
+    adapter = lora * 4 * 3 / gib
+    devices = torch.cuda.device_count()
+    capacity = sum(
+        torch.cuda.get_device_properties(i).total_memory for i in range(devices)
+    ) / gib
+    needed = weights + adapter
+    print(
+        f"GPU budget: {capacity:.2f} GiB across {devices} device(s) | "
+        f"weights {weights:.2f} + LoRA r{lora_rank} {adapter:.2f} = {needed:.2f} GiB",
+        flush=True,
+    )
+    headroom = capacity - needed
+    if headroom <= 0:
+        per_rank = lora / lora_rank
+        affordable = max(
+            (r for r in (64, 32, 16, 8, 4)
+             if weights + per_rank * r * 4 * 3 / gib < capacity),
+            default=None,
+        )
+        advice = (
+            f"Lower LORA_RANK to {affordable}, which departs from the paper and "
+            "should be recorded"
+            if affordable
+            else "Use a smaller backbone"
+        )
+        raise RuntimeError(
+            f"This cannot fit: {needed:.2f} GiB of weights and optimiser state "
+            f"against {capacity:.2f} GiB of GPU memory, before any activations.\n"
+            f"  - Switch the Kaggle accelerator to 'GPU T4 x2' "
+            f"({2 * capacity / max(devices, 1):.0f} GiB total), which shards the "
+            f"model across both and keeps the paper's rank, or\n"
+            f"  - {advice}."
+        )
+    # A 7B in fp16 leaves very little room on a 16 GB card. The run that
+    # trained for eight hours had 0.15 GiB spare at rank 8 and sequence length
+    # 768, so a thin margin is survivable but worth saying out loud.
+    if headroom < 0.5:
+        print(
+            f"  WARNING: only {headroom * 1024:.0f} MiB spare for activations. "
+            "Keep MAX_LENGTH and BATCH_SIZE small, or use 'GPU T4 x2'.",
+            flush=True,
+        )
+
+
 def _training_examples(
     instances: list[Instance],
     parser: DependencyParser,
@@ -335,6 +439,7 @@ def train(
     if not dev_instances:
         raise ValueError("Development set is empty")
 
+    check_gpu_memory(model_name, lora_rank)
     model_load_started = time.perf_counter()
     print("Loading base model and tokenizer...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -347,7 +452,13 @@ def train(
         if torch.cuda.is_available()
         else torch.float32
     )
-    model = AutoModelForCausalLM.from_pretrained(model_name, **_dtype_kwargs(model_dtype))
+    # device_map shards a model too large for one card across every visible
+    # GPU, and tells Trainer not to move it itself.
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto" if torch.cuda.is_available() else None,
+        **_dtype_kwargs(model_dtype),
+    )
     model.config.use_cache = False
     # Reentrant gradient checkpointing needs grad-enabled inputs even when the
     # base model is frozen and only LoRA adapters are trainable.
