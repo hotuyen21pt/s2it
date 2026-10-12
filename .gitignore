@@ -5,3 +5,15 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .offline_bundle/
+
+# Kaggle upload artifacts: rebuilt by scripts/prepare_offline_bundle.py
+kaggle_offline_upload/
+kaggle_offline_upload.zip
+offline_bundle/
+stanza_resources/
+runs/
+
+# Local dataset and precomputed parses: large, license-restricted,
+# and reproducible with scripts/prepare_offline_bundle.py
+converted_apc/
+stanza_parses.jsonl

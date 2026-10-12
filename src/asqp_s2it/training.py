@@ -16,8 +16,15 @@ from transformers import (
     TrainingArguments,
 )
 
+from .budget import Budget, Deadline
 from .data import Instance, category_labels
-from .prompts import auxiliary_examples, classification_prompt, extraction_prompt
+from .prompts import (
+    auxiliary_examples,
+    classification_prompt,
+    extraction_prompt,
+    render_pairs,
+    render_quads,
+)
 from .syntax import DependencyParser
 from .timing import format_duration
 
@@ -40,26 +47,18 @@ def _training_examples(
             {"aspect_term": quad.aspect_term, "opinion_term": quad.opinion_term}
             for quad in instance.quads
         ]
-        extraction_prompt_text = extraction_prompt(instance.text, parsed.global_relations())
-        extraction_output = json.dumps({"pairs": pairs}, ensure_ascii=False)
-        extraction.append((extraction_prompt_text, extraction_output))
-        reverse_pairs = [
-            {"opinion_term": quad.opinion_term, "aspect_term": quad.aspect_term}
-            for quad in instance.quads
-        ]
-        reverse_prompt_text = extraction_prompt(
-            instance.text,
-            parsed.global_relations(),
-            reverse=True,
-        )
-        reverse_output = json.dumps({"pairs": reverse_pairs}, ensure_ascii=False)
-        extraction.append((reverse_prompt_text, reverse_output))
+        relations = parsed.global_relations()
+        # Bidirectional generation of the (a, o) pair, as in S2IT Appendix B.
+        for reverse in (False, True):
+            extraction.append(
+                (
+                    extraction_prompt(instance.text, relations, reverse=reverse),
+                    render_pairs(pairs, reverse=reverse),
+                )
+            )
 
         class_prompt = classification_prompt(instance.text, pairs, parsed, categories)
-        class_output = json.dumps(
-            {"quadruples": [quad.as_dict() for quad in instance.quads]},
-            ensure_ascii=False,
-        )
+        class_output = render_quads([quad.as_dict() for quad in instance.quads])
         classification.append((class_prompt, class_output))
         structural.extend(auxiliary_examples(instance, parsed, categories))
         if index % progress_interval == 0 or index == len(instances):
@@ -72,6 +71,24 @@ def _training_examples(
                 flush=True,
             )
     return extraction, classification, structural
+
+
+class TimeBudgetCallback(TrainerCallback):
+    """Ends a stage at its deadline so the adapter is still saved.
+
+    Overrunning a Kaggle session kills the notebook before `save_pretrained`,
+    losing the whole run, so a stage that cannot finish stops early instead.
+    """
+
+    def __init__(self, deadline: Deadline) -> None:
+        self.deadline = deadline
+
+    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        if self.deadline.expired():
+            control.should_training_stop = True
+            control.should_evaluate = False
+            control.should_save = False
+        return control
 
 
 class TrainingProgressCallback(TrainerCallback):
@@ -191,8 +208,23 @@ def train(
     learning_rate: float = 5e-5,
     lora_rank: int = 32,
     max_length: int = 2048,
+    time_budget_seconds: float | None = None,
+    stage_fractions: tuple[float, float, float] = (0.25, 0.25, 0.50),
 ) -> dict[str, Any]:
+    """Run the three S2IT stages, optionally inside a wall-clock budget.
+
+    `time_budget_seconds` is the time this call may take end to end. It is split
+    across the stages by `stage_fractions`; fine-grained structural tuning gets
+    the largest share because it has the most examples per sentence.
+    """
     started_at = time.perf_counter()
+    budget = Budget(time_budget_seconds)
+    if not budget.unlimited:
+        print(
+            f"Session budget: {format_duration(time_budget_seconds)} for "
+            f"preparation, three tuning stages and saving.",
+            flush=True,
+        )
     categories = category_labels(train_instances)
     if not categories:
         raise ValueError("Training set contains no aspect categories")
@@ -242,7 +274,12 @@ def train(
     collator = CausalDataCollator(tokenizer, max_length)
     stage_names = ("global_extraction", "local_classification", "fine_grained_structure")
     stage_times: dict[str, float] = {}
-    for stage_name, examples, _dev_examples in zip(stage_names, train_stages, dev_stages):
+    # Reserve time to save the adapter once the last stage ends.
+    save_reserve = 0.0 if budget.unlimited else min(300.0, max(60.0, budget.remaining() * 0.02))
+    remaining_fractions = list(stage_fractions)
+    for stage_index, (stage_name, examples, _dev_examples) in enumerate(
+        zip(stage_names, train_stages, dev_stages)
+    ):
         if not examples:
             raise ValueError(f"Training stage {stage_name} has no examples")
         print(f"Fine-tuning stage {stage_name}: {len(examples)} examples", flush=True)
@@ -255,6 +292,16 @@ def train(
             f"{format_duration(time.perf_counter() - dataset_started)}.",
             flush=True,
         )
+        if budget.unlimited:
+            stage_deadline = Deadline(budget, None, stage_name)
+        else:
+            share = remaining_fractions[stage_index] / sum(remaining_fractions[stage_index:])
+            stage_deadline = Deadline(
+                budget,
+                max(0.0, budget.remaining() - save_reserve) * share,
+                stage_name,
+            )
+            print(f"[{stage_name}] {stage_deadline.describe()}", flush=True)
         trainer = Trainer(
             model=model,
             args=TrainingArguments(
@@ -280,7 +327,10 @@ def train(
             train_dataset=train_dataset,
             eval_dataset=dev_dataset,
             data_collator=collator,
-            callbacks=[TrainingProgressCallback(stage_name)],
+            callbacks=[
+                TrainingProgressCallback(stage_name),
+                TimeBudgetCallback(stage_deadline),
+            ],
         )
         stage_started = time.perf_counter()
         print(f"[{stage_name}] Starting training at {time.strftime('%H:%M:%S')}.", flush=True)
@@ -316,6 +366,7 @@ def train(
         "saving_seconds": saving_seconds,
         "total_elapsed_seconds": total_elapsed_seconds,
         "total_elapsed_time": format_duration(total_elapsed_seconds),
+        "budget": budget.report(),
         "hyperparameters": {
             "epochs": epochs,
             "batch_size": batch_size,

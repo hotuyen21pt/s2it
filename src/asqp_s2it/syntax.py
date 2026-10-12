@@ -5,7 +5,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
 
-import stanza
+# Stanza is imported lazily: a Kaggle run reads the precomputed parse cache and
+# never builds a pipeline, so it must not need the package installed at all.
 
 _LANGUAGE_ALIASES = {"zh": "zh-hans", "zh-cn": "zh-hans", "zh-tw": "zh-hant", "no": "nb"}
 _REQUIRED_MODEL_PATHS = {
@@ -106,6 +107,8 @@ class DependencyParser:
         resources_filepath: str | None = None,
         resources_dir: str | None = None,
     ):
+        import stanza
+
         try:
             custom_models = bool(model_paths)
             pipeline_options = dict(model_paths)
@@ -206,6 +209,8 @@ class CachedDependencyParser:
 
 
 def download_parser_models(languages: list[str]) -> None:
+    import stanza
+
     for language in languages:
         stanza.download(
             _LANGUAGE_ALIASES.get(language, language),

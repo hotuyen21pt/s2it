@@ -7,15 +7,20 @@ name = "asqp-s2it"
 version = "0.1.0"
 description = "Stepwise Syntax Integration Tuning for aspect sentiment quad prediction"
 requires-python = ">=3.10"
+# Runtime deps for training/inference. Stanza is NOT here: `syntax.py` imports
+# it lazily, so an offline Kaggle run that reads the precomputed parse cache
+# needs neither Stanza nor its model files.
 dependencies = [
     "peft>=0.12.0",
-    "stanza>=1.8.2",
     "torch>=2.2.0",
     "transformers>=4.45.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Everything `scripts/prepare_offline_bundle.py` needs on the machine that
+# builds the Kaggle archive: pip install -e ".[prepare]"
+prepare = ["stanza>=1.8.2", "langdetect>=1.0.9"]
 language-detection = ["langdetect>=1.0.9"]
 
 [project.scripts]
