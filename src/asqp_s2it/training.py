@@ -273,6 +273,19 @@ def check_gpu_memory(model_name: str, lora_rank: int, dtype_bytes: int = 2) -> N
         )
 
 
+def _set_seed(seed: int) -> None:
+    """Seed every RNG that affects the adapter, before it is created."""
+    try:
+        from transformers import set_seed
+
+        set_seed(seed)
+    except ImportError:  # pragma: no cover - transformers always provides it
+        import random
+
+        random.seed(seed)
+        torch.manual_seed(seed)
+
+
 def _training_examples(
     instances: list[Instance],
     parser: DependencyParser,
@@ -454,6 +467,8 @@ def train(
     max_length: int = 2048,
     time_budget_seconds: float | None = None,
     stage_fractions: tuple[float, float, float] | None = None,
+    seed: int = 444,
+    evaluate_dev: bool = False,
 ) -> dict[str, Any]:
     """Run the three S2IT stages, optionally inside a wall-clock budget.
 
@@ -461,8 +476,18 @@ def train(
     split across the stages in proportion to how many examples each one
     actually builds - 2, 1 and 7 per sentence, so 20/10/70 - rather than by a
     fixed guess. Pass `stage_fractions` to override.
+
+    `evaluate_dev` is off by default. Nothing here selects a checkpoint on the
+    development loss - there is no early stopping and no load_best_model - so
+    evaluating every epoch spends budget without changing the result. On this
+    data it is 92,300 forward passes, which can exceed the time left for
+    training itself and leave the adapter undertrained for no reason.
     """
     started_at = time.perf_counter()
+    # LoRA matrices are initialised in get_peft_model below, before any Trainer
+    # exists to seed the RNG, so without this two runs produce different
+    # adapters and neither can be reproduced.
+    _set_seed(seed)
     budget = Budget(time_budget_seconds)
     if not budget.unlimited:
         print(
@@ -476,7 +501,15 @@ def train(
     print("Preparing syntax-guided training examples...", flush=True)
     preparation_started = time.perf_counter()
     train_stages = _training_examples(train_instances, parser, categories, "train")
-    dev_stages = _training_examples(dev_instances, parser, categories, "dev")
+    if evaluate_dev:
+        dev_stages = _training_examples(dev_instances, parser, categories, "dev")
+    else:
+        dev_stages = ([], [], [])
+        print(
+            "Development evaluation is off: no checkpoint is selected on it, so "
+            "it would only consume the budget. Pass evaluate_dev=True to log it.",
+            flush=True,
+        )
     preparation_seconds = time.perf_counter() - preparation_started
     if not dev_instances:
         raise ValueError("Development set is empty")
@@ -558,9 +591,14 @@ def train(
         dataset_started = time.perf_counter()
         print(f"Tokenizing {stage_name} train/dev examples...", flush=True)
         train_dataset = PromptDataset(examples, tokenizer, max_length, f"{stage_name} train")
-        dev_dataset = PromptDataset(_dev_examples, tokenizer, max_length, f"{stage_name} dev")
+        dev_dataset = (
+            PromptDataset(_dev_examples, tokenizer, max_length, f"{stage_name} dev")
+            if _dev_examples
+            else None
+        )
         print(
-            f"Tokenized {len(train_dataset)} train and {len(dev_dataset)} dev examples in "
+            f"Tokenized {len(train_dataset)} train and "
+            f"{len(dev_dataset) if dev_dataset is not None else 0} dev examples in "
             f"{format_duration(time.perf_counter() - dataset_started)}.",
             flush=True,
         )
@@ -589,7 +627,7 @@ def train(
                 logging_first_step=True,
                 disable_tqdm=False,
                 save_strategy="no",
-                eval_strategy="epoch",
+                eval_strategy="epoch" if dev_dataset is not None else "no",
                 report_to="none",
                 remove_unused_columns=False,
                 gradient_checkpointing=True,
@@ -640,6 +678,8 @@ def train(
         "total_elapsed_time": format_duration(total_elapsed_seconds),
         "budget": budget.report(),
         "hyperparameters": {
+            "seed": seed,
+            "evaluate_dev": evaluate_dev,
             "epochs": epochs,
             "batch_size": batch_size,
             "gradient_accumulation_steps": gradient_accumulation_steps,

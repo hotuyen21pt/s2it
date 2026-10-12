@@ -71,7 +71,11 @@ future agent is likely to miss.
 - The dataset is this project's own hotel reviews, not Restaurant/Laptop
   ACOS, so the paper's published numbers are not comparable to these.
 - **Single run.** The paper does not state a seed policy, but one run is one
-  run; report it as such.
+  run; report it as such. `SEED` is honoured from before the LoRA matrices
+  are created, so a repeat of the same seed reproduces the adapter.
+- **Development evaluation is off** (`EVALUATE_DEV = False`). Nothing selects
+  a checkpoint on it, and evaluating every epoch is 92,300 forward passes
+  that can outlast the training budget and leave the adapter undertrained.
 - **fp16, not bf16.** The paper does not state a precision; Kaggle's T4 and
   P100 have no bf16, so `training.py` falls back to fp16.
 

@@ -98,6 +98,15 @@ MAX_LENGTH                  = 1024
 # so 20/10/70). A fixed 25/25/50 starved fine-grained tuning.
 STAGE_FRACTIONS = None
 
+# Nothing selects a checkpoint on the development loss - no early stopping, no
+# load_best_model - so evaluating it every epoch is 92,300 forward passes that
+# change nothing and can outlast the training budget itself. On only for
+# diagnostics.
+EVALUATE_DEV = False
+# LoRA is initialised before any Trainer exists to seed the RNG, so without
+# this two runs produce different adapters.
+SEED = 444
+
 # --- Inference ---------------------------------------------------------------
 # Measured on this data: the label string is ~22 tokens, longest 136.
 MAX_NEW_TOKENS = 256
@@ -377,6 +386,8 @@ if RUN_TRAINING:
         max_length=MAX_LENGTH,
         time_budget_seconds=train_budget,
         stage_fractions=STAGE_FRACTIONS,
+        seed=SEED,
+        evaluate_dev=EVALUATE_DEV,
     )
     training_metrics["notebook_training_wall_seconds"] = time.perf_counter() - notebook_training_started
     training_metrics["parser_setup_seconds"] = parser_setup_seconds
