@@ -15,6 +15,21 @@ from .syntax import DependencyParser
 BEAM_SIZE = 4
 
 
+def _dtype_kwargs(dtype) -> dict[str, Any]:
+    """`torch_dtype` is deprecated in transformers 5, which renamed it `dtype`.
+
+    Kaggle's image moves between major versions, so pick the name the
+    installed library actually accepts instead of pinning to one of them.
+    """
+    import transformers
+
+    try:
+        major = int(transformers.__version__.split(".")[0])
+    except (AttributeError, ValueError):
+        major = 4
+    return {"dtype": dtype} if major >= 5 else {"torch_dtype": dtype}
+
+
 def _chat_prompt(tokenizer: Any, prompt: str) -> str:
     return tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
@@ -46,13 +61,13 @@ class S2ITPredictor:
             )
             self.model = AutoModelForCausalLM.from_pretrained(
                 adapter_config.base_model_name_or_path,
-                torch_dtype=dtype,
+                **_dtype_kwargs(dtype),
             )
             self.model = PeftModel.from_pretrained(self.model, model_path)
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
-                torch_dtype=torch.float32,
+                **_dtype_kwargs(torch.float32),
             )
         self.model.to(self.device)
         self.model.eval()

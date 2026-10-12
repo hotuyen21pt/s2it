@@ -222,6 +222,30 @@ attach the Dataset plus the **Qwen2.5-7B-Instruct** Kaggle Model, then Run All.
 The notebook finds the zip under `/kaggle/input`, unpacks it, locates Qwen,
 and installs the six wheels from the bundle.
 
+### The Kaggle environment is not pinned
+
+The bundled wheelhouse is a **fallback, not a pin**. The notebook installs
+from it only what is genuinely missing, and prints the versions actually in
+use. Two findings forced this:
+
+- Passing bare package names to `pip install --no-index --find-links` did
+  nothing: pip answered *"Requirement already satisfied"* for all six and the
+  bundled wheels were never installed. The run silently used Kaggle's stack.
+- Kaggle moves fast. One observed image: Python 3.13, torch 2.11,
+  transformers 5.16, peft 0.20. Forcing a downgrade to transformers 4.48 on
+  that torch build is riskier than using what Kaggle tests together.
+
+Consequences to be aware of:
+
+- `peft >= 0.19` **raises** instead of returning `False` when `torchao` is
+  installed but older than it wants, and the image pairs a new peft with a
+  stale torchao. The notebook uninstalls `torchao` (nothing here uses torchao
+  quantisation) and, as a fallback, neutralises peft's probe directly.
+- `torch_dtype` was renamed `dtype` in transformers 5. `_dtype_kwargs()`
+  picks the name the installed version accepts, so both majors work.
+- **Record the printed versions with any result.** The environment is not
+  reproducible from this repo alone.
+
 ### Session budget
 
 Kaggle kills a session at the limit, which would lose the adapter. Each of the

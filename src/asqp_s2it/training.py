@@ -29,6 +29,21 @@ from .syntax import DependencyParser
 from .timing import format_duration
 
 
+def _dtype_kwargs(dtype) -> dict[str, Any]:
+    """`torch_dtype` is deprecated in transformers 5, which renamed it `dtype`.
+
+    Kaggle's image moves between major versions, so pick the name the
+    installed library actually accepts instead of pinning to one of them.
+    """
+    import transformers
+
+    try:
+        major = int(transformers.__version__.split(".")[0])
+    except (AttributeError, ValueError):
+        major = 4
+    return {"dtype": dtype} if major >= 5 else {"torch_dtype": dtype}
+
+
 def _training_examples(
     instances: list[Instance],
     parser: DependencyParser,
@@ -248,7 +263,7 @@ def train(
         if torch.cuda.is_available()
         else torch.float32
     )
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=model_dtype)
+    model = AutoModelForCausalLM.from_pretrained(model_name, **_dtype_kwargs(model_dtype))
     model.config.use_cache = False
     # Reentrant gradient checkpointing needs grad-enabled inputs even when the
     # base model is frozen and only LoRA adapters are trainable.
