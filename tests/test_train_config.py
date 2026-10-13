@@ -49,3 +49,20 @@ def test_seeding_falls_back_when_transformers_lacks_set_seed(monkeypatch):
     # ImportError is what a missing name raises for `from x import y`.
     training._set_seed(7)
     assert seeded == [7]
+
+
+def test_resuming_is_off_by_default():
+    import inspect
+
+    assert inspect.signature(training.train).parameters["resume_from"].default is None
+
+
+def test_checkpointing_cannot_be_dropped_silently():
+    """Without checkpoints there is nothing for a second session to resume.
+
+    `_training_arguments` drops any field the installed transformers does not
+    accept and merely prints what it lost. Losing this one would leave a run
+    that looks fine, finishes at its deadline and cannot be continued, so it
+    belongs in the set that raises instead.
+    """
+    assert "save_strategy" in training._ESSENTIAL_TRAINING_ARGS

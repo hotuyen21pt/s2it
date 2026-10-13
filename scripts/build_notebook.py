@@ -69,9 +69,11 @@ INFERENCE_RESERVE_MINUTES = 180  # full test split with beam-4 decoding
 SAFETY_MARGIN_MINUTES    = 15    # never finish exactly on the limit
 
 # --- Data --------------------------------------------------------------------
-# The bundle already carries the agreed 1,530-sentence training subset and
-# the full 1,831-sentence test split, shared byte-for-byte with the
-# Tree-CoT-RT bundle. Leave this at 100 to use exactly what it is given.
+# The bundle already carries the full training split and the full
+# 1,831-sentence test split, shared byte-for-byte with the Tree-CoT-RT bundle
+# (offline_bundle/subset_ids.json lists the ids). Leave this at 100 to use
+# exactly what it is given: anything less and the two baselines are no longer
+# measured on the same data.
 DATA_PERCENT     = 100
 DATA_SAMPLE_SEED = 444
 MAX_EVAL_RECORDS = None  # None = the whole test split
@@ -115,6 +117,24 @@ MAX_NEW_TOKENS = 256
 # combination this code was written against. False uses Kaggle's.
 PIN_BUNDLED_VERSIONS = True
 
+# --- Sessions ----------------------------------------------------------------
+# The full training split at the paper's 5 epochs is about 13 h 30 of training
+# plus 2 h 50 of inference, so it does not fit one 9 h session. Each stage
+# checkpoints every epoch and stops at its deadline; set RESUME_FROM in the
+# next session to the attached previous run's `s2it_outputs` directory and
+# training carries on from that checkpoint - optimiser state and the position
+# in the cosine schedule included, so the 5 epochs stay one run.
+#
+#   session 1: RESUME_FROM = None,  RUN_TRAINING = True,  RUN_INFERENCE = False
+#   session 2: RESUME_FROM = "...", RUN_TRAINING = True,  RUN_INFERENCE = False
+#              (repeat while training_progress.json reports a stage unfinished)
+#   session 3: RESUME_FROM = "...", RUN_TRAINING = False, RUN_INFERENCE = True
+#              (the adapter is read from RESUME_FROM/final; ADAPTER_DIR
+#               overrides that if you want a different one)
+#
+# Save Version at the end of a session, attach that output to the next one.
+RESUME_FROM = None
+
 RUN_TRAINING   = True
 RUN_INFERENCE  = True
 
@@ -124,13 +144,24 @@ OUTPUT_DIR = "/kaggle/working/s2it_outputs"
 # adapter trained in an earlier session (set RUN_TRAINING = False as well).
 # Leave None to use the adapter this session trains.
 ADAPTER_DIR = None
-MODEL_DIR  = ADAPTER_DIR or f"{OUTPUT_DIR}/final"
+if ADAPTER_DIR is not None:
+    MODEL_DIR = ADAPTER_DIR
+elif not RUN_TRAINING and RESUME_FROM is not None:
+    # An evaluation-only session already names the finished run through
+    # RESUME_FROM; without this it would look for an adapter under this
+    # session's own empty output directory.
+    MODEL_DIR = f"{RESUME_FROM}/final"
+else:
+    MODEL_DIR = f"{OUTPUT_DIR}/final"
 BASE_MODEL = None       # auto-discovered; set to override
 PROJECT_DIR = None      # auto-discovered from the attached zip
 DATA_DIR = None
 
 SESSION_BUDGET_SECONDS = SESSION_BUDGET_HOURS * 3600
-INFERENCE_RESERVE_SECONDS = INFERENCE_RESERVE_MINUTES * 60
+# Nothing is held back for inference in a session that will not run it: a
+# training-only session would otherwise hand three of its nine hours to a
+# phase that never starts.
+INFERENCE_RESERVE_SECONDS = INFERENCE_RESERVE_MINUTES * 60 if RUN_INFERENCE else 0
 SAFETY_MARGIN_SECONDS = SAFETY_MARGIN_MINUTES * 60
 
 
@@ -140,7 +171,7 @@ def session_remaining():
 
 
 print(f"Session budget: {SESSION_BUDGET_HOURS:.1f} h "
-      f"(reserving {INFERENCE_RESERVE_MINUTES} min for inference, "
+      f"(reserving {INFERENCE_RESERVE_SECONDS // 60:.0f} min for inference, "
       f"{SAFETY_MARGIN_MINUTES} min safety margin)")
 print(f"Training gets about "
       f"{(SESSION_BUDGET_SECONDS - INFERENCE_RESERVE_SECONDS - SAFETY_MARGIN_SECONDS - SETUP_RESERVE_MINUTES * 60) / 3600:.1f} h")
@@ -148,7 +179,7 @@ print(f"Training gets about "
 
 code(r'''
 # ========================= LOCATE AND UNPACK INPUTS =========================
-import os, sys
+import json, os, sys
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -204,12 +235,39 @@ for required in (
     if not required.exists():
         raise FileNotFoundError(f"Missing offline input: {required}")
 
+if not RUN_TRAINING and ADAPTER_DIR is None and RESUME_FROM is None:
+    raise ValueError(
+        "RUN_TRAINING is False but neither ADAPTER_DIR nor RESUME_FROM is set, "
+        "so this session has no adapter to evaluate. Attach the training "
+        "session's output and point one of them at it."
+    )
+
 if ADAPTER_DIR is not None and not (Path(MODEL_DIR) / "adapter_config.json").is_file():
     raise FileNotFoundError(
         f"ADAPTER_DIR is set but {MODEL_DIR}/adapter_config.json is missing. "
         "Attach the previous run's output and point ADAPTER_DIR at its "
         "s2it_outputs/final directory."
     )
+
+if RESUME_FROM is not None:
+    # Unlike ADAPTER_DIR, this points at the output directory itself: training
+    # needs the per-stage checkpoints beside final/, not just the adapter.
+    if not (Path(RESUME_FROM) / "final" / "adapter_config.json").is_file():
+        raise FileNotFoundError(
+            f"RESUME_FROM is set but {RESUME_FROM}/final/adapter_config.json is "
+            "missing. Attach the previous run's output and point RESUME_FROM at "
+            "its s2it_outputs directory (the one holding final/ and "
+            "training_progress.json), not at final/ itself."
+        )
+    _progress = Path(RESUME_FROM) / "training_progress.json"
+    if _progress.is_file():
+        _stages = json.loads(_progress.read_text(encoding="utf-8")).get("stages", {})
+        for _name, _state in _stages.items():
+            _mark = "done" if _state.get("complete") else "will continue"
+            print(f"Resume  : {_name} {_state.get('epochs_done', 0):g}"
+                  f"/{_state.get('epochs_target', 0):g} epochs - {_mark}")
+    else:
+        print(f"Resume  : {RESUME_FROM} (no training_progress.json; stages restart)")
 
 sys.path.insert(0, str(Path(PROJECT_DIR) / "src"))
 print("Project :", PROJECT_DIR)
@@ -355,13 +413,14 @@ One LoRA adapter is tuned through the paper's three steps in order:
 
 Each stage gets a slice of the remaining budget and **stops at its deadline**,
 so the adapter is written even if the data is larger than the session allows.
-`training_metrics.json` records which stages were truncated.
+It also checkpoints every epoch, so the next session continues from where this
+one stopped rather than starting the stage again; `training_metrics.json` and
+`training_progress.json` record how far each stage reached.
 
 **Measured on this dataset**: roughly 35 min + 20 min + 1 h 55 min per epoch
-for stages 1-3 at 8,557 sentences, so about 2 h 42 m per epoch. On the
-1,530-sentence subset that is ~29 min per epoch, and the paper's 5 epochs
-cost about 2 h 25 m. Stage 3 is the long one because it builds seven
-auxiliary examples per sentence.
+for stages 1-3 over the 8,557-sentence training split, so about 2 h 42 m per
+epoch and ~13 h 30 for the paper's 5 epochs. Stage 3 is the long one because
+it builds seven auxiliary examples per sentence.
 """)
 
 code(r'''
@@ -388,6 +447,7 @@ if RUN_TRAINING:
         stage_fractions=STAGE_FRACTIONS,
         seed=SEED,
         evaluate_dev=EVALUATE_DEV,
+        resume_from=RESUME_FROM,
     )
     training_metrics["notebook_training_wall_seconds"] = time.perf_counter() - notebook_training_started
     training_metrics["parser_setup_seconds"] = parser_setup_seconds
@@ -447,45 +507,41 @@ Two reasons, and the second is a hard requirement:
 than failing minutes later inside `Trainer.__init__` with a CUDA
 out-of-memory traceback that never mentions LoRA.
 
-### Budget
+### Budget: this needs three sessions
 
 | | time |
 |---|---|
 | setup: wheels, model load, tokenisation | ~0h20 |
-| training, 5 epochs over 1,530 sentences | ~2h25 |
+| training, 5 epochs over the 8,557-sentence split | ~13h30 |
 | full 1,831-sentence test split, 3 generations/sentence, beam 4 | ~2h50 |
 | safety margin | 0h15 |
-| **total** | **~5h50 of 9h** |
+| **total** | **~16h55, against a 9 h session** |
 
-Comfortable, which is the point: every hyperparameter is the paper's, and
-the headroom absorbs the uncertainty in the inference estimate.
+So the run is split, with the data and the paper's hyperparameters both kept
+whole:
 
-If the session still runs short, inference is what gets cut, and the metrics
-table reports how many sentences were left unscored — F1 stays measured over
-the full split either way.
+| session | settings | what it does |
+|---|---|---|
+| 1 | `RESUME_FROM = None`, `RUN_INFERENCE = False` | stages 1-2 and part of stage 3 |
+| 2 | `RESUME_FROM = "<attached>/s2it_outputs"`, `RUN_INFERENCE = False` | finishes stage 3 |
+| 3 | same `RESUME_FROM`, `RUN_TRAINING = False` | inference over the full test split |
 
-### Why 1,530 training sentences
+*Save Version* at the end of each session and attach that output to the next.
+Session 2's checkpoint carries the optimiser state and the position in the
+cosine schedule, so the five epochs are one run and not two short ones. Repeat
+session 2 if `training_progress.json` still reports a stage unfinished — the
+projection above is extrapolated from a single logged run and may be out by
+±40%.
 
-| sentences | epochs | train | + full eval | total |
-|---|---|---|---|---|
-| 8,557 | 2 | 5h24 | 2h50 | 8h47 |
-| 8,557 | **5 = paper** | 13h30 | 2h50 | **16h53 — does not fit** |
-| **1,530** | **5 = paper** | **2h25** | **2h50** | **5h50** |
+The alternative, 2 epochs over the full split, fits one session (5h24 + 2h50 =
+8h47) but changes the method rather than the schedule: a baseline trained for
+2 of the paper's 5 epochs under-reports the method it stands for. The data is
+what the comparison needs held constant, so the epochs stay and the sessions
+grow.
 
-1,530 is not an arbitrary cut: it is the size of the **Restaurant-ACOS
-training split**, one of the two datasets this method was published on
-(the other, Laptop-ACOS, has 2,934). Training at that scale with the
-paper's 5 epochs is a faithful reproduction. Keeping all 8,557 sentences
-but stopping at 2 of 5 epochs is not.
-
-The same 1,530 sentences are in the Tree-CoT-RT bundle, and both evaluate
-on the same 1,831 test sentences, so the two baselines are comparable to
-each other and to anything else trained on that subset.
-
-**Two sessions**, if you want all 8,557 sentences at 5 epochs anyway: run
-this one with `RUN_INFERENCE = False`, *Save Version*, then next session
-attach the output, set `RUN_TRAINING = False` and point `ADAPTER_DIR` at
-the attached `s2it_outputs/final`.
+If a session still runs short during inference, that is what gets cut, and the
+metrics table reports how many sentences were left unscored — F1 stays measured
+over the full split either way.
 """)
 
 code(r'''
@@ -558,13 +614,21 @@ md(r"""
 Download these from the notebook's **Output** tab:
 
 - `s2it_outputs/final/` — LoRA adapter, tokenizer, `categories.json`, `training_metrics.json`
+- `s2it_outputs/training_progress.json` — epochs reached per stage; what `RESUME_FROM` reads
+- `s2it_outputs/<stage>/checkpoint-N/` — the point a stage resumes from, one per stage
 - `s2it_outputs/training_time.csv` — per-stage and total tuning time
 - `s2it_outputs/test_predictions.jsonl` — predicted quadruples per sentence
 - `s2it_outputs/evaluation_metrics.csv` — precision, recall, exact-quadruple F1
 - `s2it_outputs/unparsable_outputs.json` — only written if some output failed to parse
 
+**Keep the whole `s2it_outputs` directory, not just `final/`** — the checkpoints
+beside it are what the next session continues from.
+
 `training_metrics.json` carries a `budget` block naming any stage that stopped
-at its deadline; that tells you whether the run was time-limited or data-limited.
+at its deadline and a `resume` block listing which stages this session trained
+and which it inherited. If `resume.complete` is false, run another session with
+`RESUME_FROM` pointing at this output before evaluating: an adapter that saw
+fewer than the paper's 5 epochs is not the baseline this is meant to report.
 """)
 
 notebook = {

@@ -41,6 +41,12 @@ def _parser() -> argparse.ArgumentParser:
     fit.add_argument("--lora-rank", type=int, default=32)
     fit.add_argument("--max-length", type=int, default=2048)
     fit.add_argument("--parser-gpu", action="store_true")
+    fit.add_argument(
+        "--resume-from",
+        help="output directory of an earlier train run: stages it finished are "
+             "skipped and the first unfinished one continues from its last "
+             "checkpoint, so the epochs stay one run across sessions",
+    )
 
     predict = commands.add_parser("predict", help="predict quadruples and report exact-tuple F1")
     predict.add_argument("--input", default="asqp_data/test.jsonl")
@@ -177,6 +183,7 @@ def main() -> None:
             learning_rate=args.learning_rate,
             lora_rank=args.lora_rank,
             max_length=args.max_length,
+            resume_from=args.resume_from,
         )
     elif args.command == "predict":
         _predict(args)

@@ -117,11 +117,14 @@ def select_subset(
     seed: int,
     subset_ids: Path | None,
 ) -> dict[str, list[str]]:
-    """Trim the training split to a fixed, reproducible set of sentences.
+    """Record the exact sentences this bundle holds, trimming them if asked.
 
-    Both baselines must train on exactly the same sentences or their scores
-    cannot be compared, so the chosen ids are written to subset_ids.json and
-    the other repository reads them back with --subset-ids.
+    Both baselines must train and evaluate on exactly the same sentences or
+    their scores cannot be compared, so the ids are written to subset_ids.json
+    and the other repository reads them back with --subset-ids. That is needed
+    even when nothing is sampled: this project's language filter removes
+    records the sibling repository still has, so "all of train" is not the
+    same set on both sides.
     """
     chosen: dict[str, list[str]] = {}
     if subset_ids is not None:
@@ -151,7 +154,17 @@ def select_subset(
         log(f"Sampling {sample_train}/{len(rows)} training sentences (seed {seed}); "
             "dev/test recorded in full for cross-repo alignment")
     else:
-        return chosen
+        # Default: train on everything. Nothing is removed below, but the full
+        # id lists are still written, because that file is what the other
+        # repository is pointed at with --subset-ids and what any third method
+        # must be scored against.
+        wanted = {
+            split: {row.instance_id for row in read_jsonl(bundle / f"{split}.jsonl")}
+            for split in SPLITS
+        }
+        counts = ", ".join(f"{split} {len(wanted[split])}" for split in SPLITS)
+        log(f"Keeping every sentence ({counts}); recording the id lists for "
+            "cross-repo alignment")
 
     for split in SPLITS:
         if split not in wanted:
@@ -388,14 +401,16 @@ def main() -> None:
     cli.add_argument(
         "--sample-train",
         type=int,
-        help="keep only this many training sentences (writes subset_ids.json)",
+        help="train on a random subset of this many sentences instead of the "
+             "whole split; omit it to keep them all (subset_ids.json is "
+             "written either way)",
     )
     cli.add_argument("--sample-seed", type=int, default=444)
     cli.add_argument(
         "--subset-ids",
         type=Path,
         help="reuse the subset_ids.json written by the other repository, so both "
-             "baselines train on identical sentences",
+             "baselines train and evaluate on identical sentences",
     )
     cli.add_argument("--skip-wheels", action="store_true", help="reuse an existing wheelhouse")
     cli.add_argument(

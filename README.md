@@ -11,7 +11,7 @@ things here look like they could be "improved" and must not be — see
 
 This repo is coupled to a sibling repo, **tree** (Tree-CoT-RT), which is the
 second baseline. The two must train and evaluate on byte-identical splits;
-see [Shared data subset](#shared-data-subset).
+see [Shared splits](#shared-splits).
 
 ---
 
@@ -20,7 +20,7 @@ see [Shared data subset](#shared-data-subset).
 | | |
 |---|---|
 | Status | Code aligned with the paper; **not yet run end to end since the rewrite** |
-| Tests | 22 pass. `tests/test_syntax.py` imports Stanza, so without it pytest fails at collection — run with `--ignore=tests/test_syntax.py` |
+| Tests | 53 pass. `tests/test_syntax.py` imports Stanza, so without it pytest fails at collection — run with `--ignore=tests/test_syntax.py` |
 | Kaggle bundle | Built and ready at `kaggle_offline_upload.zip` (not in git) |
 | Last real training run | Before the rewrite, on the old JSON format. **That adapter is obsolete** — the output format changed, so it must be retrained. |
 
@@ -63,11 +63,11 @@ future agent is likely to miss.
 | `BATCH_SIZE=1`, `GRADIENT_ACCUMULATION_STEPS=8` | The paper's "batch 4, accumulation 2" is an **effective batch of 8**. 1×8 is the same optimiser trajectory and fits 16 GB. This is not a deviation. |
 | `MAX_LENGTH = 1024` | Measured on this data: the longest stage-3 example is 786 tokens. The earlier 768 silently truncated one example in 3,600. |
 | `MAX_NEW_TOKENS = 256` | Measured: the label string is ~22 tokens, longest 136. |
+| **All 8,557 training sentences, at the paper's 5 epochs, across sessions** | That combination is ~13h30 of training and does not fit a 9 h Kaggle session. The two ways to make it fit — fewer sentences, or fewer epochs — each change what the baseline reports. Instead every stage checkpoints each epoch and `RESUME_FROM` continues it, so the cost lands on session count, which is the only thing here that is free to grow. See [Why three sessions](#why-three-sessions). |
+| **Checkpoints are kept per stage** (`save_strategy="epoch"`) | They carry the optimiser state and the position in the cosine schedule, which a bare adapter does not. Resuming without them would restart the schedule and turn 5 epochs into several short runs. `save_strategy` is in `_ESSENTIAL_TRAINING_ARGS` so a transformers that does not accept it fails loudly rather than producing an unresumable run. |
 
 ### Known deviations from the paper
 
-- **Training set is 1,530 sentences, not all 8,557.** See
-  [Why 1,530](#why-1530-sentences). Hyperparameters are the paper's.
 - The dataset is this project's own hotel reviews, not Restaurant/Laptop
   ACOS, so the paper's published numbers are not comparable to these.
 - **Single run.** The paper does not state a seed policy, but one run is one
@@ -93,6 +93,7 @@ src/asqp_s2it/
   metrics.py        exact-quadruple micro-F1
   language_prep.py  langdetect tagging, run once at bundle-build time
   budget.py         Budget/Deadline: stop a phase before Kaggle kills the session
+  resume.py         what each stage reached, and which checkpoint continues it
   cli.py            prepare-parser | prepare-language | train | predict | evaluate
 scripts/
   prepare_offline_bundle.py   build the Kaggle upload (langdetect, Stanza, wheels, zip)
@@ -131,7 +132,7 @@ Leaving **8,557 / 1,846 / 1,831**.
 
 ```bash
 pip install -e ".[prepare]"        # stanza + langdetect, build machine only
-python scripts/prepare_offline_bundle.py --sample-train 1530
+python scripts/prepare_offline_bundle.py
 ```
 
 Steps: langdetect tagging → download Stanza models for the languages present
@@ -141,8 +142,7 @@ Steps: langdetect tagging → download Stanza models for the languages present
 need not run at all:
 
 ```bash
-python scripts/prepare_offline_bundle.py \
-    --reuse-parses stanza_parses.jsonl --sample-train 1530
+python scripts/prepare_offline_bundle.py --reuse-parses stanza_parses.jsonl
 ```
 
 `--reuse-parses` verifies the cache covers every sentence before accepting it.
@@ -151,28 +151,33 @@ Output: `kaggle_offline_upload.zip` (~15 MB) containing `project/`,
 `offline_bundle/`, `UPLOAD_README.txt` and the notebook. Model weights are
 **not** in it.
 
-### Shared data subset
+### Shared splits
 
-`--sample-train 1530` writes `offline_bundle/subset_ids.json` with the chosen
-train ids **and the full dev/test id lists**. The tree repo consumes it:
+Building this bundle writes `offline_bundle/subset_ids.json`, the id list of
+every sentence it holds. The tree repo consumes it:
 
 ```bash
 cd ../tree && python scripts/prepare_offline_bundle.py \
     --subset-ids ../s2it/kaggle_offline_upload/offline_bundle/subset_ids.json
 ```
 
-Both bundles then hold identical splits (verified: 1530 / 1846 / 1831, same
-ids, same texts). Dev and test are recorded in full because this repo's
-language filter removes records the tree repo still has — without alignment
-the two F1 scores would be measured over different test sets.
+Both bundles then hold identical splits (verified: 8557 / 1846 / 1831, same
+ids, same texts). That file is needed even though nothing is sampled: this
+repo's language filter removes records the tree repo still has, so "all of
+train" is not the same set on both sides, and without alignment the two F1
+scores would be measured over different test sets.
+
+`--sample-train N` still trims the training split to a random N sentences and
+records the choice, which is how the earlier 1,530-sentence runs were built.
+It is not part of the current recipe.
 
 **Any third method compared against these baselines must use the same
 `subset_ids.json`.**
 
 ### The evaluation set
 
-**The test split is never sampled.** Training was cut to 1,530 sentences on
-purpose; evaluation keeps every sentence it can score.
+**Neither split is sampled.** Both baselines train on every sentence the
+language filter keeps, and evaluate on every sentence they can score.
 
 | | sentences |
 |---|---|
@@ -197,19 +202,43 @@ So:
 A method that needs no parser could be scored on all 1,890, but then it is
 no longer comparable to S2IT. Report 1,831 for everything.
 
-### Why 1,530 sentences
+### Why three sessions
 
-1,530 is the size of the **Restaurant-ACOS training split**, one of the two
-datasets S2IT was published on (Laptop-ACOS has 2,934). Reducing data while
-keeping the paper's hyperparameters is a faithful reproduction at a published
-scale. The alternative — all 8,557 sentences but 2 of the paper's 5 epochs —
-is a cut-down method, which is worse for a baseline.
+The full split at the paper's 5 epochs costs more than one Kaggle session, and
+each way of making it fit in one costs something the baseline is supposed to
+hold fixed:
 
-| sentences | epochs | train | + full eval | total |
+| sentences | epochs | train | + full eval | total | |
+|---|---|---|---|---|---|
+| 8,557 | 2 | 5h24 | 2h50 | 8h47 | fits, but 2 of 5 epochs under-reports the method |
+| 1,530 | 5 = paper | 2h25 | 2h50 | 5h50 | fits, but the comparison no longer holds the data constant |
+| **8,557** | **5 = paper** | **13h30** | **2h50** | **16h53** | **does not fit — so it is split across sessions** |
+
+Session count is the one budget here that can grow without changing what is
+being measured, so that is the one that grows:
+
+| session | `RESUME_FROM` | `RUN_TRAINING` | `RUN_INFERENCE` | what it does |
 |---|---|---|---|---|
-| 8,557 | 2 | 5h24 | 2h50 | 8h47 |
-| 8,557 | 5 = paper | 13h30 | 2h50 | **16h53 — does not fit** |
-| **1,530** | **5 = paper** | **2h25** | **2h50** | **5h50** |
+| 1 | `None` | True | False | stages 1–2 and part of stage 3 |
+| 2 | previous `s2it_outputs` | True | False | finishes stage 3 |
+| 3 | previous `s2it_outputs` | False | True | inference over all 1,831 test sentences |
+
+*Save Version* at the end of each, and attach that output to the next. Repeat
+session 2 while `training_progress.json` still reports a stage unfinished —
+the hours above are extrapolated from one logged run and may be out by ±40%.
+
+Session 3 reads the adapter from `RESUME_FROM/final`; `ADAPTER_DIR` overrides
+that if you want to evaluate a different one. A session with `RUN_TRAINING =
+False` and neither set stops immediately rather than looking for an adapter in
+its own empty output directory.
+
+Nothing is held back for inference in a session that will not run it, so the
+training sessions get the full nine hours minus setup.
+
+1,530, for the record, was the size of the **Restaurant-ACOS training split**,
+one of the two datasets S2IT was published on (Laptop-ACOS has 2,934). It was
+a defensible scale to reproduce at, but it is not this project's data, and
+holding the data constant across the two baselines matters more.
 
 ---
 
@@ -217,6 +246,8 @@ is a cut-down method, which is worse for a baseline.
 
 Upload `kaggle_offline_upload.zip` as a Dataset, import `s2it_kaggle.ipynb`,
 attach the Dataset plus the **Qwen2.5-7B-Instruct** Kaggle Model, then Run All.
+Expect three sessions; see [Why three sessions](#why-three-sessions) for the
+settings each one needs.
 
 - **Accelerator: T4.** S2IT is dominated by fine-tuning, which is
   compute-bound, and the T4 has 65 TFLOPS fp16 against the P100's 19.
@@ -255,7 +286,7 @@ Consequences to be aware of:
 - **Record the printed versions with any result.** The environment is not
   reproducible from this repo alone.
 
-### Session budget
+### Session budget and resuming
 
 Kaggle kills a session at the limit, which would lose the adapter. Each of the
 three stages gets a deadline from `budget.py` and stops cleanly instead;
@@ -263,8 +294,26 @@ three stages gets a deadline from `budget.py` and stops cleanly instead;
 truncated. Inference likewise stops at its deadline and reports how many
 sentences were left unscored, so F1 is always measured over the full split.
 
-`ADAPTER_DIR` lets a second session evaluate an adapter trained in a first one
-(`RUN_TRAINING = False`).
+Because the full split needs more than one session, a stopped stage is also a
+**resumable** one:
+
+- Every stage writes a checkpoint at each epoch boundary and keeps the latest
+  (`save_total_limit=1`). `training_progress.json` records the epochs each
+  stage reached and whether it finished.
+- `RESUME_FROM`, pointing at the previous run's `s2it_outputs` directory,
+  skips the stages already complete and restarts the first unfinished one from
+  its checkpoint — optimiser state and cosine-schedule position included, so
+  the 5 epochs stay one run rather than becoming several short ones.
+- Keep the whole output directory, not just `final/`: the checkpoints live
+  beside it.
+- A session stopped part-way through an epoch repeats that epoch, since
+  checkpoints are written at epoch boundaries.
+- Resuming onto a different category set is refused rather than silently
+  training the adapter on prompts it has never seen.
+
+`ADAPTER_DIR` is the inference-only counterpart: it points at a `final/`
+directory and evaluates it without training (`RUN_TRAINING = False`).
+`RESUME_FROM` points one level up and is what continues training.
 
 ---
 
@@ -272,7 +321,7 @@ sentences were left unscored, so F1 is always measured over the full split.
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q --ignore=tests/test_syntax.py   # 22 pass
+python -m pytest -q --ignore=tests/test_syntax.py   # 53 pass
 ```
 
 `tests/test_syntax.py` imports Stanza at collection time, so it is ignored
@@ -284,12 +333,14 @@ CLI:
 asqp-s2it prepare-language --input raw.jsonl --output tagged.jsonl
 asqp-s2it prepare-parser --languages en,vi,de,fr,th,zh-hans
 asqp-s2it train   --train tagged_train.jsonl --dev tagged_dev.jsonl --output-dir runs/s2it
+asqp-s2it train   ... --resume-from runs/s2it     # continue an interrupted run
 asqp-s2it predict --input tagged_test.jsonl --model-dir runs/s2it/final --output preds.jsonl
 asqp-s2it evaluate --gold tagged_test.jsonl --predictions preds.jsonl
 ```
 
 `train(..., time_budget_seconds=None)` disables the deadline, which is what
-you want off Kaggle.
+you want off Kaggle — with no deadline nothing stops early and nothing needs
+resuming.
 
 ---
 
@@ -305,7 +356,13 @@ data plus `scripts/prepare_offline_bundle.py`. A fresh clone has no data.
 
 - Not yet run end to end since the rewrite. The first Kaggle run is the real
   test of the natural-language format.
+- Resuming has not been exercised on Kaggle yet. The bookkeeping is unit
+  tested (`tests/test_resume.py`), but `PeftModel.from_pretrained(...,
+  is_trainable=True)` followed by `Trainer.train(resume_from_checkpoint=...)`
+  has not run against a real adapter here. Check the trainable-parameter count
+  the first resumed session prints before letting it run for hours.
 - Runtime figures above are extrapolated from one logged run (2h42/epoch at
-  8,557 sentences) and a memory-bandwidth model for inference. Expect ±40%.
+  8,557 sentences) and a memory-bandwidth model for inference. Expect ±40%,
+  which is also the uncertainty on "three sessions".
 - `tests/test_syntax.py` cannot run without Stanza, which needs Python ≤3.13
   (torch has no 3.14 wheels).

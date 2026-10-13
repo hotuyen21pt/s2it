@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 import torch
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -25,6 +25,15 @@ from .prompts import (
     extraction_prompt,
     render_pairs,
     render_quads,
+)
+from .resume import (
+    PROGRESS_FILENAME,
+    STAGE_NAMES,
+    assert_same_categories,
+    latest_checkpoint,
+    read_progress,
+    save_adapter,
+    write_progress,
 )
 from .syntax import DependencyParser
 from .timing import format_duration
@@ -43,6 +52,9 @@ _ESSENTIAL_TRAINING_ARGS = (
     "per_device_train_batch_size",
     "gradient_accumulation_steps",
     "lr_scheduler_type",
+    # Silently losing this would leave no checkpoint to resume from, and the
+    # full training split needs more than one Kaggle session.
+    "save_strategy",
 )
 
 
@@ -469,6 +481,7 @@ def train(
     stage_fractions: tuple[float, float, float] | None = None,
     seed: int = 444,
     evaluate_dev: bool = False,
+    resume_from: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the three S2IT stages, optionally inside a wall-clock budget.
 
@@ -482,6 +495,16 @@ def train(
     evaluating every epoch spends budget without changing the result. On this
     data it is 92,300 forward passes, which can exceed the time left for
     training itself and leave the adapter undertrained for no reason.
+
+    `resume_from` is the output directory of an earlier call. The full training
+    split at the paper's five epochs is longer than one Kaggle session, so a
+    session that runs out of time saves what it has and a later one continues:
+    stages already marked complete in `training_progress.json` are skipped, and
+    the first unfinished stage restarts from its last `checkpoint-N`, which
+    carries the optimiser state and the position in the cosine schedule. The
+    five epochs therefore stay one run rather than becoming several short ones.
+    A stage stopped part-way through an epoch repeats that epoch, since
+    checkpoints are written at epoch boundaries.
     """
     started_at = time.perf_counter()
     # LoRA matrices are initialised in get_peft_model below, before any Trainer
@@ -489,6 +512,26 @@ def train(
     # adapters and neither can be reproduced.
     _set_seed(seed)
     budget = Budget(time_budget_seconds)
+    resume_dir = Path(resume_from) if resume_from is not None else None
+    progress: dict[str, dict[str, Any]] = {}
+    if resume_dir is not None:
+        if not (resume_dir / "final" / "adapter_config.json").is_file():
+            raise FileNotFoundError(
+                f"resume_from={resume_dir} holds no final/adapter_config.json. "
+                "Point it at the output directory of the earlier run - the one "
+                f"containing final/ and {PROGRESS_FILENAME} - not at the adapter."
+            )
+        progress = read_progress(resume_dir)
+        finished = [n for n in STAGE_NAMES if progress.get(n, {}).get("complete")]
+        print(
+            f"Resuming from {resume_dir}: "
+            + (
+                f"{', '.join(finished)} already complete."
+                if finished
+                else "no stage finished in the earlier session."
+            ),
+            flush=True,
+        )
     if not budget.unlimited:
         print(
             f"Session budget: {format_duration(time_budget_seconds)} for "
@@ -498,6 +541,8 @@ def train(
     categories = category_labels(train_instances)
     if not categories:
         raise ValueError("Training set contains no aspect categories")
+    if resume_dir is not None:
+        assert_same_categories(resume_dir / "final", categories)
     print("Preparing syntax-guided training examples...", flush=True)
     preparation_started = time.perf_counter()
     train_stages = _training_examples(train_instances, parser, categories, "train")
@@ -543,17 +588,25 @@ def train(
     # base model is frozen and only LoRA adapters are trainable.
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            r=lora_rank,
-            lora_alpha=32,
-            lora_dropout=0.1,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        ),
-    )
+    if resume_dir is None:
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                r=lora_rank,
+                lora_alpha=32,
+                lora_dropout=0.1,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            ),
+        )
+    else:
+        # Continue the earlier session's adapter rather than creating a new one.
+        # is_trainable keeps the LoRA matrices requiring grad; without it peft
+        # loads them for inference and the run reports zero trainable weights.
+        adapter_dir = resume_dir / "final"
+        print(f"Loading the adapter to continue from {adapter_dir}", flush=True)
+        model = PeftModel.from_pretrained(model, str(adapter_dir), is_trainable=True)
     model_load_seconds = time.perf_counter() - model_load_started
     print(
         f"Base model ready in {format_duration(model_load_seconds)} "
@@ -561,8 +614,11 @@ def train(
         flush=True,
     )
     collator = CausalDataCollator(tokenizer, max_length)
-    stage_names = ("global_extraction", "local_classification", "fine_grained_structure")
+    stage_names = STAGE_NAMES
     stage_times: dict[str, float] = {}
+    trained_here: list[str] = []
+    inherited: list[str] = []
+    resumed_a_stage = False
     # Reserve time to save the adapter once the last stage ends.
     save_reserve = 0.0 if budget.unlimited else min(300.0, max(60.0, budget.remaining() * 0.02))
     if stage_fractions is None:
@@ -587,6 +643,15 @@ def train(
     ):
         if not examples:
             raise ValueError(f"Training stage {stage_name} has no examples")
+        if progress.get(stage_name, {}).get("complete"):
+            inherited.append(stage_name)
+            print(
+                f"[{stage_name}] finished in an earlier session "
+                f"({progress[stage_name].get('epochs_done', epochs):g} epochs); "
+                "skipping. Its budget share goes to the stages that are left.",
+                flush=True,
+            )
+            continue
         print(f"Fine-tuning stage {stage_name}: {len(examples)} examples", flush=True)
         dataset_started = time.perf_counter()
         print(f"Tokenizing {stage_name} train/dev examples...", flush=True)
@@ -626,7 +691,12 @@ def train(
                 logging_steps=10,
                 logging_first_step=True,
                 disable_tqdm=False,
-                save_strategy="no",
+                # One checkpoint per epoch, one kept. The full training split
+                # does not fit a single Kaggle session, and this is what
+                # resume_from picks up; the checkpoint carries the optimiser
+                # state and the cosine schedule, which a bare adapter does not.
+                save_strategy="epoch",
+                save_total_limit=1,
                 eval_strategy="epoch" if dev_dataset is not None else "no",
                 report_to="none",
                 remove_unused_columns=False,
@@ -642,26 +712,62 @@ def train(
                 TimeBudgetCallback(stage_deadline),
             ],
         )
+        # Only the first unfinished stage has a checkpoint to pick up; any
+        # stage after it never started, so it runs from the beginning.
+        stage_checkpoint: Path | None = None
+        if resume_dir is not None and not resumed_a_stage:
+            resumed_a_stage = True
+            stage_checkpoint = latest_checkpoint(resume_dir / stage_name)
+            if stage_checkpoint is not None:
+                print(
+                    f"[{stage_name}] continuing from {stage_checkpoint.name}; the "
+                    "optimiser state and the position in the cosine schedule come "
+                    f"with it, so this stays one {epochs}-epoch run.",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[{stage_name}] the earlier session stopped before its first "
+                    "epoch ended, so there is no checkpoint; restarting the stage.",
+                    flush=True,
+                )
         stage_started = time.perf_counter()
         print(f"[{stage_name}] Starting training at {time.strftime('%H:%M:%S')}.", flush=True)
-        trainer.train()
+        trainer.train(
+            resume_from_checkpoint=str(stage_checkpoint)
+            if stage_checkpoint is not None
+            else None
+        )
         stage_times[stage_name] = time.perf_counter() - stage_started
+        epochs_done = float(getattr(trainer.state, "epoch", 0.0) or 0.0)
+        progress[stage_name] = {
+            "epochs_done": round(epochs_done, 4),
+            "epochs_target": float(epochs),
+            "global_step": int(getattr(trainer.state, "global_step", 0) or 0),
+            "complete": epochs_done >= epochs - 1e-6,
+        }
+        trained_here.append(stage_name)
+        # Save now rather than only after the last stage: this is what the next
+        # session loads, and a session killed between stages would lose the lot.
+        save_adapter(model, tokenizer, output_dir, categories)
+        write_progress(output_dir, progress)
         print(
             f"Completed {stage_name} in "
             f"{format_duration(stage_times[stage_name])} "
             f"({stage_times[stage_name]:.2f} seconds)"
         )
+        if not progress[stage_name]["complete"]:
+            print(
+                f"[{stage_name}] stopped at its deadline after {epochs_done:.2f} of "
+                f"{epochs:g} epochs. Save Version, then set RESUME_FROM to this "
+                "run's output directory to carry on from here.",
+                flush=True,
+            )
     training_seconds = sum(stage_times.values())
 
     saving_started = time.perf_counter()
-    destination = Path(output_dir) / "final"
-    destination.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(destination)
-    tokenizer.save_pretrained(destination)
-    (destination / "categories.json").write_text(
-        json.dumps(categories, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    destination = save_adapter(model, tokenizer, output_dir, categories)
+    write_progress(output_dir, progress)
     saving_seconds = time.perf_counter() - saving_started
     total_elapsed_seconds = time.perf_counter() - started_at
     timing = {
@@ -677,6 +783,17 @@ def train(
         "total_elapsed_seconds": total_elapsed_seconds,
         "total_elapsed_time": format_duration(total_elapsed_seconds),
         "budget": budget.report(),
+        "resume": {
+            "resumed_from": str(resume_dir) if resume_dir is not None else None,
+            # training_seconds below covers this session only; stages listed as
+            # inherited were paid for by an earlier one.
+            "stages_trained_this_session": trained_here,
+            "stages_inherited": inherited,
+            "stages": progress,
+            "complete": all(
+                progress.get(name, {}).get("complete") for name in stage_names
+            ),
+        },
         "hyperparameters": {
             "seed": seed,
             "evaluate_dev": evaluate_dev,
@@ -693,6 +810,16 @@ def train(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir) / "training_metrics.json").write_text(timing_json, encoding="utf-8")
     print(f"Saved final LoRA adapter and tokenizer to {destination}")
+    if timing["resume"]["complete"]:
+        print("All three stages reached their full epoch count.")
+    else:
+        unfinished = [
+            name for name in stage_names if not progress.get(name, {}).get("complete")
+        ]
+        print(
+            f"Unfinished: {', '.join(unfinished)}. Save Version, attach this "
+            "output to the next session and set RESUME_FROM to it."
+        )
     print(f"Total training time: {timing['training_time']} ({training_seconds:.2f} seconds)")
     print(f"Total elapsed time: {timing['total_elapsed_time']} ({total_elapsed_seconds:.2f} seconds)")
     print(f"Training metrics saved to {destination / 'training_metrics.json'}")

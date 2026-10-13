@@ -27,7 +27,7 @@ def _stub_heavy_dependencies() -> None:
         torch.tensor = lambda *a, **k: None
         sys.modules.update({"torch": torch, "torch.utils": utils, "torch.utils.data": data})
     for name, attrs in (
-        ("peft", ("LoraConfig", "get_peft_model")),
+        ("peft", ("LoraConfig", "PeftModel", "get_peft_model")),
         ("transformers", ("AutoModelForCausalLM", "AutoTokenizer", "Trainer",
                           "TrainerCallback", "TrainingArguments")),
     ):
